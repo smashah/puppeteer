@@ -173,7 +173,7 @@ describe('Target', function () {
       });
       await page.evaluate(() => {
         return (globalThis as any).registrationPromise.then(
-          (registration: { unregister: () => any }) => {
+          (registration: any) => {
             return registration.unregister();
           }
         );

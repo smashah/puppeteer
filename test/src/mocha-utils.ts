@@ -282,6 +282,8 @@ export const setupTestPageAndContextHooks = (): void => {
   });
 
   afterEach(async () => {
+    // TODO: should not need page.close();
+    await state.page!.close();
     await state.context!.close();
     state.context = undefined;
     state.page = undefined;

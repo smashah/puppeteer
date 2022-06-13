@@ -52,6 +52,7 @@ describeChromeOnly('OOPIF', function () {
   });
 
   afterEach(async () => {
+    await page.close();
     await context.close();
   });
 
