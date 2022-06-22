@@ -141,10 +141,9 @@ export class FrameManager extends EventEmitter {
     session.on('Page.lifecycleEvent', (event) => {
       this.#onLifecycleEvent(event);
     });
-    session.on(
-      'Target.detachedFromTarget',
-      this.#onDetachedFromTarget.bind(this)
-    );
+    session.on('Target.detachedFromTarget', async (event) => {
+      this.#onDetachedFromTarget(event);
+    });
   }
 
   async initialize(client: CDPSession = this.#client): Promise<void> {

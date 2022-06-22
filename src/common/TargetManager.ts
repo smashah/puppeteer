@@ -20,6 +20,7 @@ import { CDPSession, Connection } from './Connection.js';
 import { EventEmitter } from './EventEmitter.js';
 import { Target } from './Target.js';
 import { debug } from './Debug.js';
+import { debugError } from './util.js';
 
 type TargetFilterCallback = (target: Protocol.Target.TargetInfo) => boolean;
 
@@ -74,8 +75,11 @@ class TrackedMap<Key, Value> {
   }
 }
 
-const debugError = (err: Error) => console.log('SILENT ERROR', err);
-
+/**
+ * TargetManager encapsulates all interactions with CDP targets.
+ * Core outside of this class should not subscribe `Target.*` events
+ * and only use the TargetManager events.
+ */
 export class TargetManager extends EventEmitter {
   #connection: Connection;
   #discoveredTargetsByTargetId: TrackedMap<string, Protocol.Target.TargetInfo> =
@@ -151,17 +155,13 @@ export class TargetManager extends EventEmitter {
     assert(!this.#detachedFromTargetListenersBySession.has(session));
     this.#detachedFromTargetListenersBySession.set(session, detachedListener);
     session.on('Target.detachedFromTarget', detachedListener);
-
-    session.on('Target.targetCreated', this.#onTargetCreated);
-    session.on('Target.targetDestroyed', this.#onTargetDestroyed);
-    session.on('Target.targetInfoChanged', this.#onTargetInfoChanged);
   }
 
   #onSessionDetached = (session: CDPSession) => {
-    this.teardownAttachmentListeners(session);
+    this.removeSessionListeners(session);
   };
 
-  teardownAttachmentListeners(session: CDPSession | Connection): void {
+  removeSessionListeners(session: CDPSession): void {
     if (this.#attachedToTargetListenersBySession.has(session)) {
       session.off(
         'Target.attachedToTarget',
@@ -177,10 +177,6 @@ export class TargetManager extends EventEmitter {
       );
       this.#detachedFromTargetListenersBySession.delete(session);
     }
-
-    session.off('Target.targetCreated', this.#onTargetCreated);
-    session.off('Target.targetDestroyed', this.#onTargetDestroyed);
-    session.off('Target.targetInfoChanged', this.#onTargetInfoChanged);
   }
 
   attachedTargets(): Map<string, Target> {
@@ -191,7 +187,6 @@ export class TargetManager extends EventEmitter {
     this.#connection.off('Target.targetCreated', this.#onTargetCreated);
     this.#connection.off('Target.targetDestroyed', this.#onTargetDestroyed);
     this.#connection.off('Target.targetInfoChanged', this.#onTargetInfoChanged);
-    this.teardownAttachmentListeners(this.#connection);
   }
 
   async initialize(): Promise<void> {
@@ -260,45 +255,41 @@ export class TargetManager extends EventEmitter {
       event
     );
     const targetInfo = event.targetInfo;
-
     const session = this.#connection.session(event.sessionId);
-
     if (!session) {
       throw new Error(`Session ${event.sessionId} was not created.`);
     }
 
+    // 1) From here on, we should either detach the session or keep it.
+
+    // Should silently detach? Currently, only service workers attached to
+    // not-main targets have to be detached.
     // See https://source.chromium.org/chromium/chromium/src/+/main:content/browser/devtools/devtools_agent_host_impl.cc?ss=chromium&q=f:devtools%20-f:out%20%22::kTypePage%5B%5D%22
     // for the complete list of available types.
-    switch (event.targetInfo.type) {
-      // TODO: handle workers through hooks.
-      case 'worker':
-      case 'iframe':
-      case 'page':
-      case 'background_page':
-      case 'webview':
-      case 'other':
-      case 'auction_worklet':
-      case 'browser':
-        break;
-      case 'service_worker':
-        // If we don't detach from service workers, they will never die.
-        if (parentSession instanceof CDPSession) {
-          console.log('RUN IF WAITING', session.id(), targetInfo);
-          await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
-          console.log('SILENT DETACH', session.id(), targetInfo);
-          await parentSession
-            .send('Target.detachFromTarget', {
-              sessionId: session.id(),
-            })
-            .catch(debugError);
-          return;
-        } else {
-          break;
-        }
-      default:
-        break;
+    if (
+      targetInfo.type === 'service_worker' &&
+      parentSession instanceof CDPSession
+    ) {
+      debugTargetManager(
+        'Silently detaching a session',
+        'parentSession',
+        parentSession instanceof CDPSession ? parentSession.id() : 'main',
+        'targetInfo',
+        targetInfo
+      );
+      await session.send('Runtime.runIfWaitingForDebugger').catch(debugError);
+      await parentSession
+        .send('Target.detachFromTarget', {
+          sessionId: session.id(),
+        })
+        .catch(debugError);
+      // When we detach silently, we don't register the session/target in any maps.
+      return;
     }
 
+    // 2) Here we check the target filter and silently detach from targes that
+    //    don't match. It is similar to the previous branch so perhaps except
+    //    with record the targetId in ignoredTargets.
     if (this.#targetFilterCallback && !this.#targetFilterCallback(targetInfo)) {
       this.#ignoredTargets.add(targetInfo.targetId);
       await session.send('Runtime.runIfWaitingForDebugger').catch(debugError);
@@ -307,26 +298,37 @@ export class TargetManager extends EventEmitter {
           sessionId: session.id(),
         })
         .catch(debugError);
+      // When we detach silently, we don't register the session/target in any maps.
       return;
     }
 
-    console.log('TARGET ALREADY ATTACHED', targetInfo, this.#attachedTargetsByTargetId.has(targetInfo.targetId));
-    const target = this.#attachedTargetsByTargetId.has(targetInfo.targetId) ?
-      this.#attachedTargetsByTargetId.get(targetInfo.targetId)! : this.#targetFactory(targetInfo, session);
+    // 3) At this point, we are sure that the session exists and that the target
+    //    should be attached to. One target might be attached to multiple
+    //    sessions. Therefore, we need to check if we already attached to it.
+    const existingTarget = this.#attachedTargetsByTargetId.has(
+      targetInfo.targetId
+    );
 
-    if (this.#attachedTargetsByTargetId.has(targetInfo.targetId)) {
+    const target = existingTarget
+      ? this.#attachedTargetsByTargetId.get(targetInfo.targetId)!
+      : this.#targetFactory(targetInfo, session);
+
+    // 4) Set up listeners for the session so that session events are received.
+    this.setupAttachmentListeners(session);
+
+    // 5) Update the maps
+    if (existingTarget) {
       this.#attachedTargetsBySessionId.set(
         session.id(),
         this.#attachedTargetsByTargetId.get(targetInfo.targetId)!
       );
-      return;
+    } else {
+      this.#attachedTargetsByTargetId.set(targetInfo.targetId, target);
+      this.#attachedTargetsBySessionId.set(session.id(), target);
     }
 
-    this.#attachedTargetsByTargetId.set(targetInfo.targetId, target);
-    this.#attachedTargetsBySessionId.set(session.id(), target);
-
-    this.setupAttachmentListeners(session);
-
+    // 6) At this point the target is paused so we can allow clients to
+    //    configure themselves using hooks.
     for (const hook of this.#targetAttachHooks) {
       if (!(parentSession instanceof Connection)) {
         assert(this.#attachedTargetsBySessionId.has(parentSession.id()));
@@ -339,6 +341,14 @@ export class TargetManager extends EventEmitter {
       );
     }
 
+    // 7) Track if the tar‚get gas been initialized.
+    this.#targetsIdsForInit.delete(target._targetId);
+    this.emit(TargetManagerEmittedEvents.AttachedToTarget, target);
+    if (this.#targetsIdsForInit.size === 0) {
+      this.#initializeCallback();
+    }
+
+    // 8) Actually resume the target and configure auto-attach.
     await Promise.all([
       session.send('Target.setAutoAttach', {
         waitForDebuggerOnStart: true,
@@ -347,17 +357,16 @@ export class TargetManager extends EventEmitter {
       }),
       session.send('Runtime.runIfWaitingForDebugger'),
     ]).catch(debugError);
+    // TODO: the browser might be shutting down here. What do we do with the
+    // error?
 
-    // TODO: the browser might be shutting down here. What do we do with the error?
-
-    console.log('RUN IF WAITING', session.id(), this.#attachedTargetsBySessionId.get(session.id())!._getTargetInfo())
-
-    this.#targetsIdsForInit.delete(target._targetId);
-    console.log('ATTACHED TO TARGET', target._getTargetInfo());
-    this.emit(TargetManagerEmittedEvents.AttachedToTarget, target);
-    if (this.#targetsIdsForInit.size === 0) {
-      this.#initializeCallback();
-    }
+    // 9) The service worker target needs to be detached. TODO: figure out if
+    //    this is correct. if (targetInfo.type === 'service_worker') { await
+    //    parentSession .send('Target.detachFromTarget', { sessionId:
+    //    session.id(),
+    //     })
+    //     .catch(debugError);
+    //    }
   };
 
   #onDetachedFromTarget = (
@@ -382,8 +391,6 @@ export class TargetManager extends EventEmitter {
 
     this.#attachedTargetsByTargetId.delete(target._targetId);
     this.emit(TargetManagerEmittedEvents.DetachedFromTarget, target);
-
-    console.log('DETACHED FROM TARGET', event.targetId, event.sessionId);
   };
 }
 

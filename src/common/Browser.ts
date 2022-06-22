@@ -306,13 +306,18 @@ export class Browser extends EventEmitter {
     }
   }
 
+  #emitDisconnected = () => {
+    this.emit(BrowserEmittedEvents.Disconnected);
+  };
+
   /**
    * @internal
    */
   async _attach(): Promise<void> {
-    this.#connection.on(ConnectionEmittedEvents.Disconnected, () => {
-      return this.emit(BrowserEmittedEvents.Disconnected);
-    });
+    this.#connection.on(
+      ConnectionEmittedEvents.Disconnected,
+      this.#emitDisconnected
+    );
     this.#targetManager.on(
       TargetManagerEmittedEvents.AttachedToTarget,
       this.#onAttachedToTarget
@@ -332,9 +337,10 @@ export class Browser extends EventEmitter {
    * @internal
    */
   _detach(): void {
-    this.#connection.off(ConnectionEmittedEvents.Disconnected, () => {
-      return this.emit(BrowserEmittedEvents.Disconnected);
-    });
+    this.#connection.off(
+      ConnectionEmittedEvents.Disconnected,
+      this.#emitDisconnected
+    );
     this.#targetManager.off(
       TargetManagerEmittedEvents.AttachedToTarget,
       this.#onAttachedToTarget

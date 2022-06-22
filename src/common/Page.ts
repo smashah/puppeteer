@@ -19,11 +19,7 @@ import type { Readable } from 'stream';
 import { Accessibility } from './Accessibility.js';
 import { assert, assertNever } from './assert.js';
 import { Browser, BrowserContext } from './Browser.js';
-import {
-  CDPSession,
-  CDPSessionEmittedEvents,
-  // Connection,
-} from './Connection.js';
+import { CDPSession, CDPSessionEmittedEvents } from './Connection.js';
 import { ConsoleMessage, ConsoleMessageType } from './ConsoleMessage.js';
 import { Coverage } from './Coverage.js';
 import { Dialog } from './Dialog.js';
@@ -583,6 +579,9 @@ export class Page extends EventEmitter {
       return this.#onFileChooser(event);
     });
     this.#target._isClosedPromise.then(() => {
+      this.#target
+        ._targetManager()
+        .removeTargetAttachHook(this.#targetAttachHook);
       this.emit(PageEmittedEvents.Close);
       this.#closed = true;
     });
@@ -3023,9 +3022,6 @@ export class Page extends EventEmitter {
   async close(
     options: { runBeforeUnload?: boolean } = { runBeforeUnload: undefined }
   ): Promise<void> {
-    this.#target
-      ._targetManager()
-      .removeTargetAttachHook(this.#targetAttachHook);
     const connection = this.#client.connection();
     assert(
       connection,
