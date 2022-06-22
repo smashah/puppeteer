@@ -74,6 +74,8 @@ class TrackedMap<Key, Value> {
   }
 }
 
+const debugError = (err: Error) => console.log('SILENT ERROR', err);
+
 export class TargetManager extends EventEmitter {
   #connection: Connection;
   #discoveredTargetsByTargetId: TrackedMap<string, Protocol.Target.TargetInfo> =
@@ -265,16 +267,6 @@ export class TargetManager extends EventEmitter {
       throw new Error(`Session ${event.sessionId} was not created.`);
     }
 
-    if (this.#attachedTargetsByTargetId.has(targetInfo.targetId)) {
-      this.#attachedTargetsBySessionId.set(
-        session.id(),
-        this.#attachedTargetsByTargetId.get(targetInfo.targetId)!
-      );
-      return;
-    }
-
-    const target = this.#targetFactory(targetInfo, session);
-
     // See https://source.chromium.org/chromium/chromium/src/+/main:content/browser/devtools/devtools_agent_host_impl.cc?ss=chromium&q=f:devtools%20-f:out%20%22::kTypePage%5B%5D%22
     // for the complete list of available types.
     switch (event.targetInfo.type) {
@@ -290,27 +282,43 @@ export class TargetManager extends EventEmitter {
         break;
       case 'service_worker':
         // If we don't detach from service workers, they will never die.
-        await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
         if (parentSession instanceof CDPSession) {
-          assert(!this.#attachedTargetsByTargetId.get(targetInfo.targetId));
-          this.#attachedTargetsByTargetId.set(targetInfo.targetId, target);
-          this.#attachedTargetsBySessionId.set(session.id(), target);
-          this.emit(TargetManagerEmittedEvents.AttachedToTarget, target);
+          console.log('RUN IF WAITING', session.id(), targetInfo);
+          await session.send('Runtime.runIfWaitingForDebugger').catch(() => {});
+          console.log('SILENT DETACH', session.id(), targetInfo);
           await parentSession
             .send('Target.detachFromTarget', {
               sessionId: session.id(),
             })
-            .catch(() => {});
+            .catch(debugError);
+          return;
+        } else {
+          break;
         }
-        return;
       default:
         break;
     }
 
     if (this.#targetFilterCallback && !this.#targetFilterCallback(targetInfo)) {
       this.#ignoredTargets.add(targetInfo.targetId);
-      await session.send('Runtime.runIfWaitingForDebugger');
-      await session.detach();
+      await session.send('Runtime.runIfWaitingForDebugger').catch(debugError);
+      await parentSession
+        .send('Target.detachFromTarget', {
+          sessionId: session.id(),
+        })
+        .catch(debugError);
+      return;
+    }
+
+    console.log('TARGET ALREADY ATTACHED', targetInfo, this.#attachedTargetsByTargetId.has(targetInfo.targetId));
+    const target = this.#attachedTargetsByTargetId.has(targetInfo.targetId) ?
+      this.#attachedTargetsByTargetId.get(targetInfo.targetId)! : this.#targetFactory(targetInfo, session);
+
+    if (this.#attachedTargetsByTargetId.has(targetInfo.targetId)) {
+      this.#attachedTargetsBySessionId.set(
+        session.id(),
+        this.#attachedTargetsByTargetId.get(targetInfo.targetId)!
+      );
       return;
     }
 
@@ -331,21 +339,21 @@ export class TargetManager extends EventEmitter {
       );
     }
 
-    try {
-      await Promise.all([
-        session.send('Target.setAutoAttach', {
-          waitForDebuggerOnStart: true,
-          flatten: true,
-          autoAttach: true,
-        }),
-        session.send('Target.setDiscoverTargets', { discover: true }),
-        session.send('Runtime.runIfWaitingForDebugger'),
-      ]);
-    } catch (error) {
-      // TODO: the browser might be shutting down here. What do we do with the error?
-    }
+    await Promise.all([
+      session.send('Target.setAutoAttach', {
+        waitForDebuggerOnStart: true,
+        flatten: true,
+        autoAttach: true,
+      }),
+      session.send('Runtime.runIfWaitingForDebugger'),
+    ]).catch(debugError);
+
+    // TODO: the browser might be shutting down here. What do we do with the error?
+
+    console.log('RUN IF WAITING', session.id(), this.#attachedTargetsBySessionId.get(session.id())!._getTargetInfo())
 
     this.#targetsIdsForInit.delete(target._targetId);
+    console.log('ATTACHED TO TARGET', target._getTargetInfo());
     this.emit(TargetManagerEmittedEvents.AttachedToTarget, target);
     if (this.#targetsIdsForInit.size === 0) {
       this.#initializeCallback();
@@ -371,15 +379,11 @@ export class TargetManager extends EventEmitter {
     if (!target) {
       return;
     }
-    this.#attachedTargetsByTargetId.delete(target._targetId);
 
-    if (
-      target._getTargetInfo().type !== 'service_worker' ||
-      (target._getTargetInfo().type === 'service_worker' &&
-        parentSession instanceof CDPSession)
-    ) {
-      this.emit(TargetManagerEmittedEvents.DetachedFromTarget, target);
-    }
+    this.#attachedTargetsByTargetId.delete(target._targetId);
+    this.emit(TargetManagerEmittedEvents.DetachedFromTarget, target);
+
+    console.log('DETACHED FROM TARGET', event.targetId, event.sessionId);
   };
 }
 

@@ -147,7 +147,7 @@ describe('Target', function () {
       expect(allPages).not.toContain(otherPage);
     }
   );
-  itFailsFirefox(
+  it.only(
     'should report when a service worker is created and destroyed',
     async () => {
       const { page, server, context } = getTestState();
